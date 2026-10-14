@@ -1080,6 +1080,7 @@ Ctrl+C
 
 **Next milestone:** Create a Django Customer model and successfully save and retrieve data using Django ORM.
 
+[⬆ Back to Table of Contents](#table-of-contents)
 
 ---
 
@@ -1104,6 +1105,8 @@ The goal is to:
 4. Create the corresponding table in local Cloudflare D1.
 5. Verify the database schema.
 6. Prepare to test Django ORM operations inside Cloudflare Workers.
+
+[⬆ Back to Table of Contents](#table-of-contents)
 
 ### 9.2 Create the Django Application
 
@@ -1147,6 +1150,9 @@ class Customer(models.Model):
 
 Django automatically provides a primary key when one is not explicitly defined.
 
+
+[⬆ Back to Table of Contents](#table-of-contents)
+
 ### 9.4 Problem: Django Migration Command Fails
 
 The initial migration command was:
@@ -1188,6 +1194,8 @@ flowchart TD
     F -->|Yes: Workers runtime| H["Cloudflare runtime modules available"]
 ```
 
+[⬆ Back to Table of Contents](#table-of-contents)
+
 ### 9.5 Solution: Temporary SQLite Configuration for Migration Generation
 
 **File:** `src/hello_django/settings.py`
@@ -1221,6 +1229,8 @@ This separates two operations:
 | Run Django inside Cloudflare Workers | Cloudflare D1 |
 
 **Important:** The SQLite configuration is used only to generate migration files. It does not migrate or populate the Cloudflare D1 database.
+
+[⬆ Back to Table of Contents](#table-of-contents)
 
 ### 9.6 Generate the Customer Migration
 
@@ -1318,6 +1328,8 @@ This SQL creates a table corresponding to the test model.
 
 The `--local` option ensures the operation targets the local development D1 database rather than the remote production database.
 
+[⬆ Back to Table of Contents](#table-of-contents)
+
 ### 9.9 Verify the Local D1 Table
 
 Check whether the table exists:
@@ -1345,6 +1357,8 @@ Expected columns:
 - `email`
 
 **Verification status:** Pending confirmation.
+
+[⬆ Back to Table of Contents](#table-of-contents)
 
 ### 9.10 Planned Django ORM Test
 
@@ -1421,3 +1435,7 @@ Wrangler's `--local` flag targets the local development database. Remote databas
 The manual SQL approach is useful for testing basic D1 connectivity, but a proper migration strategy is still required before deploying the full CRM.
 
 **Next milestone:** Verify the local `crm_test_customer` table and test Django ORM read/write operations inside Cloudflare Workers.
+
+[⬆ Back to Table of Contents](#table-of-contents)
+
+---
