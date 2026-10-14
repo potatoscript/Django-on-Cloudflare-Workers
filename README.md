@@ -15,6 +15,19 @@
 6. [Successful Test Results](#6-successful-test-results)
 7. [Cloudflare D1 and Django ORM Integration](#7-cloudflare-d1-and-django-orm-integration)
 8. [Next Steps — CRM Integration and Deployment](#8-next-steps--crm-integration-and-deployment)
+9. [Django Customer Model and D1 Migration Testing](#9-django-customer-model-and-d1-migration-testing)
+   - [9.1 Objective](#91-objective)
+   - [9.2 Create the Django Application](#92-create-the-django-application)
+   - [9.3 Define the Customer Model](#93-define-the-customer-model)
+   - [9.4 Problem: Django Migration Command Fails](#94-problem-django-migration-command-fails)
+   - [9.5 Solution: Temporary SQLite Configuration for Migration Generation](#95-solution-temporary-sqlite-configuration-for-migration-generation)
+   - [9.6 Generate the Customer Migration](#96-generate-the-customer-migration)
+   - [9.7 Verify Migration Consistency](#97-verify-migration-consistency)
+   - [9.8 Create the Customer Table in Local Cloudflare D1](#98-create-the-customer-table-in-local-cloudflare-d1)
+   - [9.9 Verify the Local D1 Table](#99-verify-the-local-d1-table)
+   - [9.10 Planned Django ORM Test](#910-planned-django-orm-test)
+   - [9.11 Progress Summary](#911-progress-summary)
+   - [9.12 Key Lessons Learned](#912-key-lessons-learned)
 
 ---
 
@@ -1066,3 +1079,345 @@ Ctrl+C
 **Current milestone:** Preparing to test Django ORM operations with Cloudflare D1.
 
 **Next milestone:** Create a Django Customer model and successfully save and retrieve data using Django ORM.
+
+
+---
+
+
+## 9. Django Customer Model and D1 Migration Testing
+
+**Date:** October 14, 2026  
+**Project:** `django-cloudflare-test`  
+**Environment:** Ubuntu WSL2, Python 3.13, Django 6.1.2, Cloudflare Workers, Cloudflare D1
+
+### 9.1 Objective
+
+The next development milestone is to integrate Django's Object-Relational Mapper (ORM) with Cloudflare D1.
+
+The initial test uses a simple `Customer` model containing a customer name and email address.
+
+The goal is to:
+
+1. Create a Django application named `crm_test`.
+2. Define the `Customer` model.
+3. Generate a Django migration.
+4. Create the corresponding table in local Cloudflare D1.
+5. Verify the database schema.
+6. Prepare to test Django ORM operations inside Cloudflare Workers.
+
+### 9.2 Create the Django Application
+
+Navigate to the project directory:
+
+```bash
+cd ~/projects/django-cloudflare-test
+```
+
+Create the application directory and initialize the Django app:
+
+```bash
+mkdir -p src/crm_test
+uv run django-admin startapp crm_test src/crm_test
+```
+
+Register the application in `src/hello_django/settings.py`:
+
+```python
+INSTALLED_APPS = [
+    # Keep existing installed applications
+    "crm_test",
+]
+```
+
+### 9.3 Define the Customer Model
+
+**File:** `src/crm_test/models.py`
+
+```python
+from django.db import models
+
+
+class Customer(models.Model):
+    name = models.CharField(max_length=100)
+    email = models.EmailField()
+
+    def __str__(self):
+        return self.name
+```
+
+Django automatically provides a primary key when one is not explicitly defined.
+
+### 9.4 Problem: Django Migration Command Fails
+
+The initial migration command was:
+
+```bash
+PYTHONPATH=src uv run django-admin makemigrations crm_test --settings=hello_django.settings
+```
+
+It failed with:
+
+```text
+ModuleNotFoundError: No module named 'js'
+```
+
+Followed by:
+
+```text
+django.core.exceptions.ImproperlyConfigured:
+'django_cf.db.backends.d1' isn't an available database backend
+or couldn't be imported.
+```
+
+#### Root Cause
+
+The Cloudflare D1 backend imports Cloudflare's `workers` package, which depends on the `js` module provided by Pyodide.
+
+Standard CPython running inside Ubuntu does not provide this module.
+
+Therefore, the error does not mean the `Customer` model is incorrect or that `django-cf` is necessarily missing.
+
+```mermaid
+flowchart TD
+    A["Run django-admin makemigrations"] --> B["Django initializes models"]
+    B --> C["Load django_cf.db.backends.d1"]
+    C --> D["Import Cloudflare workers package"]
+    D --> E["Import js module"]
+    E --> F{"Running inside Pyodide?"}
+    F -->|No: Ubuntu CPython| G["ModuleNotFoundError: No module named js"]
+    F -->|Yes: Workers runtime| H["Cloudflare runtime modules available"]
+```
+
+### 9.5 Solution: Temporary SQLite Configuration for Migration Generation
+
+**File:** `src/hello_django/settings.py`
+
+Configure the database backend conditionally:
+
+```python
+import os
+
+if os.environ.get("DJANGO_MIGRATION_GENERATION") == "1":
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": ":memory:",
+        }
+    }
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django_cf.db.backends.d1",
+            "CLOUDFLARE_BINDING": "DB",
+        }
+    }
+```
+
+This separates two operations:
+
+| Operation | Database backend |
+|---|---|
+| Generate migration files in Ubuntu | SQLite |
+| Run Django inside Cloudflare Workers | Cloudflare D1 |
+
+**Important:** The SQLite configuration is used only to generate migration files. It does not migrate or populate the Cloudflare D1 database.
+
+### 9.6 Generate the Customer Migration
+
+Run:
+
+```bash
+DJANGO_MIGRATION_GENERATION=1 PYTHONPATH=src uv run django-admin makemigrations crm_test --settings=hello_django.settings
+```
+
+The migration was generated successfully.
+
+**Generated file:**
+
+```text
+src/crm_test/migrations/0001_initial.py
+```
+
+Actual generated content:
+
+```python
+# Generated by Django 6.1.2 on 2026-10-14 09:27
+
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    initial = True
+
+    dependencies = [
+    ]
+
+    operations = [
+        migrations.CreateModel(
+            name='Customer',
+            fields=[
+                ('id', models.BigAutoField(
+                    auto_created=True,
+                    primary_key=True,
+                    serialize=False,
+                    verbose_name='ID'
+                )),
+                ('name', models.CharField(max_length=100)),
+                ('email', models.EmailField(max_length=254)),
+            ],
+        ),
+    ]
+```
+
+The migration defines the following table:
+
+**Table name:** `crm_test_customer`
+
+| Column | Django field | Purpose |
+|---|---|---|
+| `id` | `BigAutoField` | Automatically generated primary key |
+| `name` | `CharField(max_length=100)` | Customer name |
+| `email` | `EmailField(max_length=254)` | Customer email address |
+
+### 9.7 Verify Migration Consistency
+
+The migration command was executed again:
+
+```bash
+DJANGO_MIGRATION_GENERATION=1 PYTHONPATH=src uv run django-admin makemigrations crm_test --settings=hello_django.settings
+```
+
+**Actual result:**
+
+```text
+No changes detected in app 'crm_test'
+```
+
+**Status: SUCCESS**
+
+This confirms that the current `Customer` model matches the generated migration definition.
+
+It does **not** mean the database table has already been created.
+
+### 9.8 Create the Customer Table in Local Cloudflare D1
+
+The next planned step is to create the table using Wrangler.
+
+```bash
+cd ~/projects/django-cloudflare-test
+```
+
+```bash
+npx wrangler d1 execute django-crm-db --local --command "CREATE TABLE IF NOT EXISTS crm_test_customer (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100) NOT NULL, email VARCHAR(254) NOT NULL)"
+```
+
+This SQL creates a table corresponding to the test model.
+
+**Note:** This is a manual schema creation test, not execution of Django's migration framework. It does not update Django's `django_migrations` history table.
+
+The `--local` option ensures the operation targets the local development D1 database rather than the remote production database.
+
+### 9.9 Verify the Local D1 Table
+
+Check whether the table exists:
+
+```bash
+npx wrangler d1 execute django-crm-db --local --command "SELECT name FROM sqlite_master WHERE type='table' AND name='crm_test_customer'"
+```
+
+Expected table name:
+
+```text
+crm_test_customer
+```
+
+Inspect the table columns:
+
+```bash
+npx wrangler d1 execute django-crm-db --local --command "PRAGMA table_info(crm_test_customer)"
+```
+
+Expected columns:
+
+- `id`
+- `name`
+- `email`
+
+**Verification status:** Pending confirmation.
+
+### 9.10 Planned Django ORM Test
+
+Once the local D1 table has been verified, the next task is to test Django ORM operations from inside the Cloudflare Workers runtime.
+
+Example record creation:
+
+```python
+from crm_test.models import Customer
+
+Customer.objects.create(
+    name="Cloudflare Test Customer",
+    email="test@example.com",
+)
+```
+
+Example record retrieval:
+
+```python
+customers = Customer.objects.all()
+```
+
+The test will use a local-only endpoint and avoid exposing an unauthenticated database-writing endpoint in a deployed application.
+
+```mermaid
+flowchart TD
+    A["Browser request"] --> B["Cloudflare Workers / Pyodide"]
+    B --> C["Django WSGI application"]
+    C --> D["Django Customer model"]
+    D --> E["Django ORM"]
+    E --> F["django-cf D1 backend"]
+    F --> G[("Local Cloudflare D1")]
+    G --> H["crm_test_customer table"]
+```
+
+### 9.11 Progress Summary
+
+| Task | Status |
+|---|---|
+| Create `crm_test` application | Completed |
+| Define `Customer` model | Completed |
+| Diagnose missing `js` module | Completed |
+| Configure temporary SQLite migration backend | Completed |
+| Generate `0001_initial.py` | Completed |
+| Verify no model changes remain | Completed |
+| Create Customer table in local D1 | Pending confirmation |
+| Verify D1 table schema | Pending confirmation |
+| Insert customer using Django ORM | Not started |
+| Retrieve customer using Django ORM | Not started |
+| Test remote Cloudflare D1 | Not started |
+| Deploy Django CRM online | Not started |
+
+### 9.12 Key Lessons Learned
+
+**1. Cloudflare Workers Python is different from standard CPython.**
+
+Cloudflare's Python runtime uses Pyodide and provides JavaScript interoperability modules that are not available in ordinary Ubuntu Python.
+
+**2. `makemigrations` and `migrate` are different commands.**
+
+- `makemigrations` generates migration definitions.
+- `migrate` applies migrations to a database.
+
+**3. Django migration files can be generated using SQLite.**
+
+A temporary SQLite backend allows Django to generate model migration files without importing the Cloudflare D1 backend.
+
+**4. Local D1 and remote D1 are separate environments.**
+
+Wrangler's `--local` flag targets the local development database. Remote database operations require a separate, deliberate command.
+
+**5. Manual SQL table creation is not equivalent to Django migrations.**
+
+The manual SQL approach is useful for testing basic D1 connectivity, but a proper migration strategy is still required before deploying the full CRM.
+
+**Next milestone:** Verify the local `crm_test_customer` table and test Django ORM read/write operations inside Cloudflare Workers.
