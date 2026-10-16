@@ -29,6 +29,23 @@
    - [9.11 Progress Summary](#911-progress-summary)
    - [9.12 Key Lessons Learned](#912-key-lessons-learned)
 
+
+10. [Django ORM Integration with Cloudflare D1 — Debugging and Successful Testing](#10-django-orm-integration-with-cloudflare-d1--debugging-and-successful-testing)
+    - [10.1 Objective](#101-objective)
+    - [10.2 Initial Problem — HTTP 500 Internal Server Error](#102-initial-problem--http-500-internal-server-error)
+    - [10.3 Verify Cloudflare D1 Configuration](#103-verify-cloudflare-d1-configuration)
+    - [10.4 Diagnose the Django ORM Error](#104-diagnose-the-django-orm-error)
+    - [10.5 Temporary Workaround — DJANGO_ALLOW_ASYNC_UNSAFE](#105-temporary-workaround--django_allow_async_unsafe)
+    - [10.6 Successful Customer Creation and Retrieval](#106-successful-customer-creation-and-retrieval)
+    - [10.7 Inspect Cloudflare Workers WSGI Implementation](#107-inspect-cloudflare-workers-wsgi-implementation)
+    - [10.8 Inspect django-cf Database Backend](#108-inspect-django-cf-database-backend)
+    - [10.9 Discovery — django-cf Already Provides handle_wsgi()](#109-discovery--django-cf-already-provides-handle_wsgi)
+    - [10.10 Update src/entry.py to Use django-cf](#1010-update-srcentrypy-to-use-django-cf)
+    - [10.11 Final Test Results](#1011-final-test-results)
+    - [10.12 Development Progress](#1012-development-progress)
+    - [10.13 Lessons Learned](#1013-lessons-learned)
+    - [10.14 Next Development Tasks](#1014-next-development-tasks)
+
 ---
 
 ## 1. System Architecture
@@ -1435,6 +1452,530 @@ Wrangler's `--local` flag targets the local development database. Remote databas
 The manual SQL approach is useful for testing basic D1 connectivity, but a proper migration strategy is still required before deploying the full CRM.
 
 **Next milestone:** Verify the local `crm_test_customer` table and test Django ORM read/write operations inside Cloudflare Workers.
+
+[⬆ Back to Table of Contents](#table-of-contents)
+
+---
+
+# 10. Django ORM Integration with Cloudflare D1 — Debugging and Successful Testing
+
+**Date:** October 16, 2026  
+**Project:** Django on Cloudflare Workers  
+**Development Environment:** Ubuntu WSL2 / Windows  
+**Framework:** Django 6.1.2  
+**Database:** Cloudflare D1 (`django-crm-db`)  
+**Django D1 Backend:** `django-cf` 0.2.17  
+**Workers Runtime SDK:** 1.9.3
+
+## 10.1 Objective
+
+The objective was to verify that Django's Object-Relational Mapper (ORM) could successfully communicate with Cloudflare D1 through Cloudflare Workers.
+
+The tasks included:
+
+1. Testing the Django Customer API.
+2. Investigating an HTTP 500 error.
+3. Verifying the D1 database configuration.
+4. Diagnosing Django's asynchronous safety exception.
+5. Testing Customer creation and retrieval.
+6. Inspecting the Cloudflare Workers WSGI adapter.
+7. Replacing the manual compatibility workaround with the `django-cf` helper.
+
+## 10.2 Initial Problem — HTTP 500 Internal Server Error
+
+After starting the Cloudflare Workers development server:
+
+```bash
+uv run --with workers-py pywrangler dev
+```
+
+The terminal displayed:
+
+```text
+[wrangler:info] Ready on http://localhost:8787
+[wrangler:info] GET / 200 OK
+[wrangler:info] GET /favicon.ico 404 Not Found
+[wrangler:info] GET /customers 404 Not Found
+[wrangler:info] GET /customers/ 500 Internal Server Error
+```
+
+The root endpoint worked, confirming that Django was running.
+
+The `/customers` endpoint returned 404 because the URL pattern required a trailing slash.
+
+The `/customers/` endpoint returned 500, indicating a server-side exception during Customer retrieval.
+
+## 10.3 Verify Cloudflare D1 Configuration
+
+Checked the local D1 table:
+
+```bash
+npx wrangler d1 execute django-crm-db --local --command "PRAGMA table_info(crm_test_customer)"
+```
+
+**Result: Successful**
+
+| Column | Data type |
+|---|---|
+| id | INTEGER |
+| name | VARCHAR(100) |
+| email | VARCHAR(254) |
+
+Checked the Wrangler D1 binding:
+
+```bash
+grep -n -A 8 '"d1_databases"' wrangler.jsonc
+```
+
+The configuration contained:
+
+```json
+"d1_databases": [
+  {
+    "binding": "DB",
+    "database_name": "django-crm-db",
+    "database_id": "24f02e3d-80c5-4b68-8e67-9b93848f8f97"
+  }
+]
+```
+
+The table existed, and the database binding was configured correctly.
+
+## 10.4 Diagnose the Django ORM Error
+
+Temporarily updated `src/crm_test/views.py` to return exception information:
+
+```python
+from django.http import JsonResponse
+from .models import Customer
+
+
+def customer_list(request):
+    try:
+        customers = list(
+            Customer.objects.values("id", "name", "email")
+        )
+
+        return JsonResponse({
+            "status": "success",
+            "customers": customers,
+        })
+
+    except Exception as e:
+        return JsonResponse({
+            "status": "error",
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+        }, status=500)
+```
+
+The API returned:
+
+```json
+{
+  "status": "error",
+  "error_type": "SynchronousOnlyOperation",
+  "error_message": "You cannot call this from an async context - use a thread or sync_to_async."
+}
+```
+
+### Root Cause
+
+Cloudflare Workers uses an asynchronous request handler:
+
+```python
+async def fetch(self, request):
+    ...
+```
+
+Django's ORM contains safeguards against executing synchronous database operations within an asynchronous context.
+
+The Cloudflare WSGI adapter executes the synchronous Django application from the asynchronous Workers handler.
+
+As a result, Django raised `SynchronousOnlyOperation`.
+
+## 10.5 Temporary Workaround — DJANGO_ALLOW_ASYNC_UNSAFE
+
+For local testing, added the following environment variable to `src/entry.py` before importing Django:
+
+```python
+os.environ["DJANGO_ALLOW_ASYNC_UNSAFE"] = "true"
+```
+
+This bypassed Django's asynchronous safety restriction.
+
+After restarting the development server, the Customer API returned:
+
+```json
+{
+  "status": "success",
+  "customers": []
+}
+```
+
+**Result: Successful ORM read test**
+
+The empty list indicated that the query executed successfully but no customer records were present.
+
+**Important:** This setting disables Django's async-safety protection. It does not make synchronous ORM operations inherently safe under concurrency.
+
+## 10.6 Successful Customer Creation and Retrieval
+
+Added a temporary Customer creation endpoint using Django ORM:
+
+```python
+customer = Customer.objects.create(
+    name="Cloudflare Test Customer",
+    email="test@example.com",
+)
+```
+
+The creation endpoint was tested with:
+
+```bash
+curl -i -X POST http://localhost:8787/customers/create/ \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Cloudflare Test Customer","email":"test@example.com"}'
+```
+
+The Customer list endpoint then returned:
+
+```json
+{
+  "status": "success",
+  "customers": [
+    {
+      "id": 1,
+      "name": "Cloudflare Test Customer",
+      "email": "test@example.com"
+    }
+  ]
+}
+```
+
+**Result: Successful ORM write-and-read test**
+
+This confirmed that Django ORM could create and retrieve a Customer record through the configured D1 backend in the local Workers environment.
+
+The creation endpoint used `csrf_exempt` for testing and must be secured or removed before public deployment.
+
+## 10.7 Inspect Cloudflare Workers WSGI Implementation
+
+Attempted to inspect the WSGI adapter using standard Python:
+
+```bash
+uv run python -c "import inspect; from workers import wsgi; print(inspect.getfile(wsgi))"
+```
+
+The command failed:
+
+```text
+ModuleNotFoundError: No module named 'js'
+```
+
+This occurs because the Cloudflare Workers Python package depends on the Pyodide-provided `js` module, which is unavailable in ordinary Ubuntu CPython.
+
+Instead, located the source file without importing it:
+
+```bash
+find .venv/lib/python3.13/site-packages/workers -iname '*wsgi*'
+```
+
+Result:
+
+```text
+.venv/lib/python3.13/site-packages/workers/wsgi.py
+```
+
+Inspected the file:
+
+```bash
+sed -n '1,240p' \
+  .venv/lib/python3.13/site-packages/workers/wsgi.py
+```
+
+The source describes how the adapter bridges synchronous WSGI operations with the asynchronous Workers runtime using Pyodide's JSPI capabilities.
+
+## 10.8 Inspect django-cf Database Backend
+
+Located the shared database wrapper:
+
+```bash
+grep -R -n 'class CFDatabaseWrapper' \
+  .venv/lib/python3.13/site-packages/django_cf
+```
+
+Result:
+
+```text
+django_cf/db/base_engine.py:464:
+class CFDatabaseWrapper(SQLiteDatabaseWrapper):
+```
+
+Inspected the implementation:
+
+```bash
+sed -n '450,550p' \
+  .venv/lib/python3.13/site-packages/django_cf/db/base_engine.py
+```
+
+Important implementation details:
+
+```python
+class CFDatabaseWrapper(SQLiteDatabaseWrapper):
+    transaction_modes = frozenset([])
+
+    def _savepoint_allowed(self):
+        return False
+
+    def _start_transaction_under_autocommit(self):
+        return
+```
+
+### Findings
+
+The backend is based on Django's SQLite database wrapper but adapts its behavior for Cloudflare storage.
+
+The inspected implementation disables savepoints and does not start ordinary interactive transactions.
+
+This is important when designing CRM operations involving multiple related records.
+
+## 10.9 Discovery — django-cf Already Provides handle_wsgi()
+
+Inspected the library initialization file:
+
+```bash
+cat .venv/lib/python3.13/site-packages/django_cf/__init__.py
+```
+
+The installed package contains:
+
+```python
+import os
+
+from workers import wsgi
+
+
+async def handle_wsgi(request, app, env=None):
+    os.environ.setdefault("DJANGO_ALLOW_ASYNC_UNSAFE", "1")
+
+    return await wsgi.fetch(app, request, env)
+```
+
+### Key Discovery
+
+The `django-cf` library already provides a WSGI integration helper named `handle_wsgi()`.
+
+This helper:
+
+1. Sets `DJANGO_ALLOW_ASYNC_UNSAFE` if it has not already been set.
+2. Calls Cloudflare Workers' `wsgi.fetch()` adapter.
+
+Previously, the project called `wsgi.fetch()` directly, bypassing the `django-cf` helper.
+
+## 10.10 Update src/entry.py to Use django-cf
+
+**File:** `src/entry.py`
+
+Previous implementation:
+
+```python
+import os
+
+os.environ["DJANGO_ALLOW_ASYNC_UNSAFE"] = "true"
+
+from workers import WorkerEntrypoint, wsgi
+
+os.environ.setdefault(
+    "DJANGO_SETTINGS_MODULE",
+    "hello_django.settings",
+)
+
+from hello_django.wsgi import application
+
+
+class Default(WorkerEntrypoint):
+    async def fetch(self, request):
+        return await wsgi.fetch(
+            application,
+            request,
+            self.env,
+        )
+```
+
+Updated implementation:
+
+```python
+import os
+
+from workers import WorkerEntrypoint
+from django_cf import handle_wsgi
+
+os.environ.setdefault(
+    "DJANGO_SETTINGS_MODULE",
+    "hello_django.settings",
+)
+
+from hello_django.wsgi import application
+
+
+class Default(WorkerEntrypoint):
+    async def fetch(self, request):
+        return await handle_wsgi(
+            request,
+            application,
+            self.env,
+        )
+```
+
+### What Changed?
+
+Replaced:
+
+```python
+from workers import WorkerEntrypoint, wsgi
+```
+
+with:
+
+```python
+from workers import WorkerEntrypoint
+from django_cf import handle_wsgi
+```
+
+And replaced:
+
+```python
+return await wsgi.fetch(application, request, self.env)
+```
+
+with:
+
+```python
+return await handle_wsgi(request, application, self.env)
+```
+
+The manually added environment variable was removed from `entry.py`.
+
+The library now applies the same compatibility override internally.
+
+### Important Clarification
+
+Using `handle_wsgi()` does not eliminate the async-safety override. It moves responsibility for setting it into the `django-cf` helper.
+
+The current implementation works in local testing, but concurrent production behavior still requires validation.
+
+## 10.11 Final Test Results
+
+Restarted the Cloudflare Workers development server:
+
+```bash
+uv run --with workers-py pywrangler dev
+```
+
+Tested:
+
+```text
+http://localhost:8787/
+http://localhost:8787/customers/
+```
+
+The Customer endpoint successfully returned the previously created record.
+
+**Final confirmed result:**
+
+```json
+{
+  "status": "success",
+  "customers": [
+    {
+      "id": 1,
+      "name": "Cloudflare Test Customer",
+      "email": "test@example.com"
+    }
+  ]
+}
+```
+
+### Updated Architecture
+
+```mermaid
+flowchart TD
+    A["Browser / HTTP Request"] --> B["Cloudflare Workers"]
+    B --> C["src/entry.py"]
+    C --> D["django_cf.handle_wsgi()"]
+    D --> E["Set DJANGO_ALLOW_ASYNC_UNSAFE=1"]
+    E --> F["workers.wsgi.fetch()"]
+    F --> G["Django WSGI Application"]
+    G --> H["crm_test Customer View"]
+    H --> I["Django ORM"]
+    I --> J["django-cf D1 Backend"]
+    J --> K[("Local Cloudflare D1")]
+    K --> L["crm_test_customer"]
+```
+
+## 10.12 Development Progress
+
+| Task | Status |
+|---|---|
+| Start Django on Cloudflare Workers | Completed |
+| Configure Cloudflare D1 binding | Completed |
+| Create Customer model | Completed |
+| Generate Customer migration | Completed |
+| Create Customer table using local D1 SQL | Completed |
+| Diagnose HTTP 500 error | Completed |
+| Identify SynchronousOnlyOperation | Completed |
+| Test ORM read operations | Completed |
+| Test ORM write operations | Completed |
+| Inspect Workers WSGI adapter | Completed |
+| Inspect django-cf database wrapper | Completed |
+| Integrate django-cf handle_wsgi() | Completed |
+| Verify Customer retrieval after integration change | Completed |
+| Verify concurrent-request safety | Pending |
+| Implement secure authentication and API endpoints | Pending |
+| Establish Django migration deployment process | Pending |
+| Deploy Django CRM to Cloudflare | Pending |
+
+## 10.13 Lessons Learned
+
+**1. Django ORM can operate with Cloudflare D1 using django-cf.**
+
+The local test successfully created and retrieved a Customer record.
+
+**2. Cloudflare Workers uses a different Python runtime from ordinary Ubuntu Python.**
+
+Cloudflare's Pyodide runtime provides the `js` integration required by the Workers SDK.
+
+**3. SynchronousOnlyOperation is an async-safety exception.**
+
+It can occur when Django detects synchronous ORM operations inside an asynchronous context.
+
+**4. django-cf provides a WSGI integration helper.**
+
+Using `django_cf.handle_wsgi()` follows the package's built-in integration approach and avoids manually setting the override in the Worker entry point.
+
+**5. The compatibility helper is not a concurrency-safety guarantee.**
+
+The library still sets `DJANGO_ALLOW_ASYNC_UNSAFE`. Production safety must be evaluated separately.
+
+**6. Cloudflare D1 has transaction limitations.**
+
+The inspected backend does not provide ordinary interactive transactions or savepoints. CRM workflows involving related records must account for these limitations.
+
+**7. Testing should proceed incrementally.**
+
+Verifying the table, binding, error message, package source, and ORM operations individually made the root cause easier to identify.
+
+## 10.14 Next Development Tasks
+
+1. Test concurrent Customer read/write requests and evaluate the safety of the current integration.
+2. Remove temporary exception-detail responses and the CSRF-exempt test endpoint.
+3. Establish a reliable migration strategy for Cloudflare D1.
+4. Evaluate compatibility with the existing Django CRM models: Customer, Contact, Opportunity, and Activity.
+5. Configure production settings, authentication, secrets, and deployment.
+6. Deploy the CRM as a separate Cloudflare Worker without affecting the existing Vue.js website.
+
+**End-of-day milestone:** Django ORM successfully created and retrieved Customer records from local Cloudflare D1, and the Worker entry point now uses the `django-cf` library's built-in WSGI helper.
 
 [⬆ Back to Table of Contents](#table-of-contents)
 
